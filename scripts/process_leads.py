@@ -104,8 +104,10 @@ def clean_data(registrations: pd.DataFrame, scans: pd.DataFrame) -> tuple[pd.Dat
     
     # Remove unicode replacement characters (common encoding issue)
     for df in [registrations, scans]:
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].apply(lambda x: str(x).replace('\ufffd', '') if pd.notna(x) else x)
+        for col in df.columns:
+            dtype = df[col].dtype
+            if pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype):
+                df[col] = df[col].apply(lambda x: str(x).replace('\ufffd', '') if pd.notna(x) else x)
     
     print(f"Cleaned data (UUID column: '{uuid_col}')")
     if normalized_names:
