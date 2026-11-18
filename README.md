@@ -135,8 +135,8 @@ Place both files in the project root.
 #### 3.2 Run the Script
 
 ```bash
-# Install dependencies (first time only)
-pip install -r requirements.txt
+# Install dependencies (first time only; hash-locked)
+pip install --require-hashes -r requirements.lock
 
 # Process leads (default: reads registrations.csv + raw_scans.csv)
 python scripts/process_leads.py
@@ -144,6 +144,8 @@ python scripts/process_leads.py
 # Or pass filenames explicitly
 python scripts/process_leads.py registrations.csv Raw_Scans.csv
 ```
+
+Dependencies (updated 2026-11-18): `requirements.txt` holds the human-edited ranges (`pandas>=2.0.0`); `requirements.lock` is the hash-locked install set generated from it with `pip-compile --generate-hashes --strip-extras --allow-unsafe --output-file requirements.lock requirements.txt` on Python 3.12 (pandas 3.1.1, numpy 2.5.5). pandas 3 was tested against pandas 2.3.3 on real event data and produced byte-identical reports, so no upper bound is set. After editing `requirements.txt`, recompile the lock and re-run the script.
 
 #### 3.3 Output
 

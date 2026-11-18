@@ -112,7 +112,7 @@ Browser smoke test:
 1. The local folder still has the old name because Windows locked the directory during the rename attempt.
 2. GitHub Pages may need a short redeploy window after the repo rename and push.
 3. The current `API_URL` in `index.html` still points to the last configured Apps Script Web App URL. For the next event, replace it with that event's Web App URL.
-4. The Pandas deprecation warning is not caused by the rebrand. It is safe for the current run but should be cleaned up later.
+4. The Pandas deprecation warning is not caused by the rebrand. Fixed on 2026-11-18 (see Next Steps item 9).
 5. `reports\leads_srhuni.csv` was regenerated during verification, but its content did not show as modified in git status at the time of the handoff.
 
 ## Next Steps
@@ -175,4 +175,4 @@ Delete the disposable row if needed
 python scripts\process_leads.py registrations.csv raw_scans.csv
 ```
 
-9. Optional cleanup for a future patch: silence the Pandas warning in `scripts/process_leads.py` by replacing the deprecated `select_dtypes(include=['object'])` usage with an explicit object/string-safe approach and rerun the CSV processing workflow.
+9. Done 2026-11-18: the Pandas warning in `scripts/process_leads.py` is fixed (the `select_dtypes(include=['object'])` loop now checks object or string dtype per column, so pandas 3 string columns are still cleaned). Reports are byte-identical on pandas 2.3.3 and 3.1.1. Installs now use the hash-locked `requirements.lock` (see README section 3.2).
