@@ -1,6 +1,13 @@
 # traQRecord Handoff Context
 
-Last updated: 2026-05-29
+## Security update (2026-11-20)
+
+The scanner uses credentialed organization links and a receiver for a separate scanner workbook. The DXJ China event scanner workbook was created as owner-only, with `Raw_Scans`, `participant_url`, and `valid_tickets`. The `dxj-china-event` workflow was published with the UUID-only write active. The source and destination UUID lists matched across all 84 tickets at cutover, including three added after the initial backfill.
+
+The event's Apps Script web app is deployed and its `/exec` URL is configured in [index.html](index.html). The next event setup step is to generate organization links with `generateParticipantUrls()` and verify a scan with one of those links. Use [README.md](README.md) for the current data flow and [TESTING.md](TESTING.md) for the deployment checks.
+
+## Original rebrand handoff (2026-05-29)
+
 Working directory at update time: `C:\Users\user\Documents\LEAF\shorelight-lead-scanner`
 Git branch: `main`
 Git remote after rename: `origin https://github.com/Givi-Guntsadze/traqrecord.git`

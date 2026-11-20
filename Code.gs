@@ -1,92 +1,717 @@
 /**
- * traQRecord Lead Receiver - Google Apps Script
- * 
- * This script receives scan data from the PWA and appends it to the active sheet.
+ * traQRecord Scan Receiver - Google Apps Script
+ *
+ * Bind this project only to the private, PII-free the scanner workbook workbook.
  * Deploy as: Web App | Execute as: Me | Access: Anyone
- * 
- * IMPORTANT: After updating this code, you MUST create a NEW deployment
- * (Deploy -> New Deployment), not just save. Then update the URL in index.html.
  */
 
+const SCAN_SHEETS = Object.freeze({
+  RAW_SCANS: 'Raw_Scans',
+  PARTICIPANTS: 'participant_url',
+  VALID_TICKETS: 'valid_tickets'
+});
+
+const SCAN_HEADERS = Object.freeze({
+  RAW_SCANS: ['Timestamp', 'Uni_ID', 'UUID'],
+  PARTICIPANTS: [
+    'Participant_Name',
+    'Participant_ID',
+    'Token_Hash',
+    'Active',
+    'Scanner_URL'
+  ],
+  VALID_TICKETS: ['UUID']
+});
+
+const TOKEN_PATTERN = /^[a-f0-9]{64}$/;
+const TICKET_ID_PATTERN = /^[A-Z0-9]{8}$/;
+const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const MAX_PARTICIPANT_ID_LENGTH = 50;
+const SCAN_SPREADSHEET_ID_PROPERTY = 'SCAN_SPREADSHEET_ID';
+const SPREADSHEET_ID_PATTERN = /^[A-Za-z0-9_-]{20,}$/;
+
+// --- High-volume synchronization tuning ---
+//
+// A transport limit only: the most scans one HTTP request may carry, not a
+// cap on how many scans a device can queue or eventually get accepted. The
+// frontend chunks any backlog into consecutive requests of at most this
+// size until it is drained. 10 comfortably covers "one volunteer scans 5-6
+// visitors back-to-back" with headroom, while keeping the JSON payload and
+// the per-request validation loop small enough that a single slow request
+// never represents an unbounded amount of work.
+const MAX_BATCH_SIZE = 10;
+const MAX_POST_LENGTH = 16 * 1024;
+
+// The lock now protects only the final write phase (recheck + append), not
+// validation or duplicate lookups, so a short wait is enough: a well-behaved
+// request holds it for well under a second. A requester that can't get the
+// lock in this window returns server_busy immediately rather than making a
+// volunteer's device sit on an open connection for up to the previous 10s.
+const LOCK_WAIT_MS = 2000;
+
+// Positive-only cache: a UUID is cached only once it has been confirmed
+// present in valid_tickets. A cache miss always falls back to a live sheet
+// read, so a newly registered ticket is usable on the very next scan
+// attempt, not bounded by this TTL. The TTL only controls how long a
+// *repeat* lookup of an already-confirmed ticket (e.g. the same visitor
+// scanned by a second, third, fourth institution) can skip the sheet
+// entirely.
+const VALID_TICKET_CACHE_PREFIX = 'vt_';
+const VALID_TICKET_CACHE_TTL_SECONDS = 300;
+
+// Participant lookups cache both outcomes (found-and-active, or
+// not-found/inactive) because participant_url is small and effectively
+// static during an event, unlike valid_tickets. The TTL bounds how long a
+// revoked link (Active -> FALSE) or a rotated token can keep working after
+// an organizer changes it: up to PARTICIPANT_CACHE_TTL_SECONDS. 60 seconds
+// is short enough that a compromised-link revocation is operationally
+// meaningful (the organizer is doing this manually, not reacting to a
+// live attack in progress) while still avoiding a sheet read on nearly
+// every scan from the same device.
+const PARTICIPANT_CACHE_PREFIX = 'p_';
+const PARTICIPANT_CACHE_TTL_SECONDS = 60;
+
+// Duplicate keys are cached for the CacheService maximum (6 hours), long
+// enough to cover a single event day. This cache is populated only at the
+// moment a row is actually written (or found already written), so it can
+// never cause a false accept: a cache miss always falls back to a real
+// Raw_Scans read before anything is treated as non-duplicate.
+const DUPLICATE_CACHE_PREFIX = 'dup_';
+const DUPLICATE_CACHE_TTL_SECONDS = 21600;
+
 /**
- * Handle GET requests (browser redirects often convert POST to GET)
+ * GET is deliberately non-mutating. Scan credentials belong in a POST body,
+ * not in URLs that can be retained by logs or browser history.
  */
-function doGet(e) {
-  return handleRequest(e, 'GET');
+function doGet() {
+  return createResponse({ result: 'error', code: 'method_not_allowed' });
 }
 
 /**
- * Handle POST requests
+ * Receive one or more queued scans from the static scanner.
+ *
+ * Two wire formats are accepted so the frontend and this backend can be
+ * redeployed independently without ever silently failing every scan:
+ *
+ * - New: a JSON body shaped { scans: [{ client_id, participant_id, token,
+ *   uuid, timestamp }, ...] }, answered with
+ *   { results: [{ client_id, result, code, duplicate }, ...] }.
+ * - Legacy: the original single-scan application/x-www-form-urlencoded
+ *   body, answered with the original flat { result, code, duplicate }
+ *   shape. Preserved for any client still running the pre-batching
+ *   frontend.
  */
 function doPost(e) {
-  return handleRequest(e, 'POST');
+  return handleScanRequest(e);
+}
+
+function handleScanRequest(e) {
+  const rawBody = e && e.postData && e.postData.contents;
+  if (typeof rawBody !== 'string' || !rawBody || rawBody.length > MAX_POST_LENGTH) {
+    return createResponse({ result: 'error', code: 'invalid_request' });
+  }
+  const batchInput = parseBatchInput(e);
+  if (batchInput) {
+    if (batchInput.scans.length > MAX_BATCH_SIZE) {
+      // MAX_BATCH_SIZE is a transport limit the official frontend enforces
+      // by chunking locally; it never sends an oversized request. A batch
+      // over this size can only come from a non-conforming client, so it is
+      // rejected outright with a bounded response rather than iterating over
+      // and reflecting an attacker-controlled number of scans.
+      return createResponse({
+        results: [],
+        result: 'error',
+        code: 'invalid_request'
+      });
+    }
+    const batchResults = processScanBatch(batchInput.scans);
+    return createResponse({ results: batchResults });
+  }
+
+  const legacyScan = parsePostParameters(e);
+  legacyScan.client_id = 'legacy';
+  const single = processScanBatch([legacyScan])[0];
+  return createResponse({
+    result: single.result,
+    code: single.code,
+    duplicate: single.duplicate
+  });
 }
 
 /**
- * Unified request handler for both GET and POST
+ * A JSON batch request is detected by content, not by header, since Apps
+ * Script normalizes some content-type handling. Anything that isn't a
+ * parseable { scans: [...] } object is treated as the legacy form-encoded
+ * protocol instead.
  */
-function handleRequest(e, method) {
-  const lock = LockService.getScriptLock();
-  
-  try {
-    lock.waitLock(10000);
-  } catch (err) {
-    return createResponse({ result: 'error', message: 'Server busy' });
+function parseBatchInput(e) {
+  const raw = e && e.postData && typeof e.postData.contents === 'string'
+    ? e.postData.contents
+    : '';
+  if (!raw) {
+    return null;
   }
 
+  let parsed;
   try {
-    let data = null;
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    return null;
+  }
 
-    // Parse data based on request type
-    if (method === 'POST' && e.postData && e.postData.contents) {
-      data = JSON.parse(e.postData.contents);
-    } else if (e.parameter && e.parameter.data) {
-      // Handle data passed as URL parameter
-      data = JSON.parse(e.parameter.data);
-    } else if (e.parameter && e.parameter.uni && e.parameter.uuid) {
-      // Handle individual URL parameters
-      data = {
-        uni: e.parameter.uni,
-        uuid: e.parameter.uuid,
-        timestamp: e.parameter.timestamp || new Date().toISOString()
-      };
+  if (!parsed || !Array.isArray(parsed.scans)) {
+    return null;
+  }
+
+  return { scans: parsed.scans };
+}
+
+function normalizeScanInput(raw) {
+  const source = raw || {};
+  return {
+    clientId: typeof source.client_id === 'string' ? source.client_id : '',
+    participantId: source.participant_id,
+    token: source.token,
+    uuid: source.uuid,
+    timestamp: source.timestamp
+  };
+}
+
+function toDiagnosticData(item) {
+  return {
+    participant_id: item.participantId,
+    uuid: item.uuid
+  };
+}
+
+function errorResult(clientId, code) {
+  return { client_id: clientId, result: 'error', code: code };
+}
+
+function successResult(clientId, duplicate) {
+  return { client_id: clientId, result: 'success', duplicate: duplicate };
+}
+
+/**
+ * Validate and, where accepted, write a batch of scans as efficiently as
+ * possible for high concurrent volume:
+ *
+ *  1. Per-scan validation (format, participant auth, ticket) runs
+ *     entirely before any lock is taken, using caches and lazy request-local
+ *     snapshots so each validation sheet is read at most once per request.
+ *  2. Duplicate detection runs once for the whole batch (one Raw_Scans
+ *     read at most, not one per scan), also cache-assisted.
+ *  3. The script lock is only acquired if there is something left to
+ *     write, is held only for a final cache recheck plus one batched
+ *     range write, and is requested with a short timeout so a busy
+ *     backend fails fast instead of making every volunteer wait.
+ */
+function processScanBatch(rawItems) {
+  const results = [];
+
+  let spreadsheet;
+  let participantSheet;
+  let ticketSheet;
+  let rawScanSheet;
+  try {
+    spreadsheet = getConfiguredScanSpreadsheet();
+    participantSheet = requireSheetWithHeaders(
+      spreadsheet,
+      SCAN_SHEETS.PARTICIPANTS,
+      SCAN_HEADERS.PARTICIPANTS
+    );
+    ticketSheet = requireSheetWithHeaders(
+      spreadsheet,
+      SCAN_SHEETS.VALID_TICKETS,
+      SCAN_HEADERS.VALID_TICKETS
+    );
+    rawScanSheet = requireSheetWithHeaders(
+      spreadsheet,
+      SCAN_SHEETS.RAW_SCANS,
+      SCAN_HEADERS.RAW_SCANS
+    );
+  } catch (error) {
+    for (let i = 0; i < rawItems.length; i += 1) {
+      const failedItem = normalizeScanInput(rawItems[i]);
+      logDiagnostic('error', 'scan_error', 'server_error', toDiagnosticData(failedItem), null, String(error));
+      results.push(errorResult(failedItem.clientId, 'server_error'));
+    }
+    return results;
+  }
+
+  // Bound expensive sheet work even for distinct unknown tokens/tickets.
+  // Keep snapshots local to this request so new registrations are visible
+  // on the next request, without introducing a negative-ticket cache TTL.
+  const validationData = { participantRows: null, ticketIds: null };
+  const accepted = [];
+  for (let index = 0; index < rawItems.length; index += 1) {
+    const item = normalizeScanInput(rawItems[index]);
+    const diagnosticData = toDiagnosticData(item);
+
+    if (!isValidParticipantId(item.participantId) ||
+        !TOKEN_PATTERN.test(item.token || '') ||
+        !isValidTicketId(item.uuid) ||
+        !isValidTimestamp(item.timestamp)) {
+      logDiagnostic('warn', 'scan_rejected', 'invalid_request', diagnosticData);
+      results.push(errorResult(item.clientId, 'invalid_request'));
+      continue;
     }
 
-    // Validate
-    if (!data || !data.uni || !data.uuid) {
-      return createResponse({ 
-        result: 'error', 
-        message: 'Missing data. Required: uni, uuid',
-        received: e.parameter || 'none'
-      });
+    const participant = findActiveParticipantCached(participantSheet, hashToken(item.token), validationData);
+
+    // The token is authoritative. The public ID is checked only to detect a
+    // modified or accidentally mismatched participant link.
+    if (!participant || participant.id !== item.participantId) {
+      logDiagnostic('warn', 'scan_rejected', 'unauthorized', diagnosticData);
+      results.push(errorResult(item.clientId, 'unauthorized'));
+      continue;
     }
 
-    // Get or create sheet
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    let sheet = ss.getSheetByName('Raw_Scans');
-    
-    if (!sheet) {
-      sheet = ss.insertSheet('Raw_Scans');
-      sheet.appendRow(['Timestamp', 'Uni_ID', 'UUID']);
-      sheet.getRange(1, 1, 1, 3).setFontWeight('bold');
+    if (!isValidTicketCached(ticketSheet, item.uuid, validationData)) {
+      logDiagnostic('warn', 'scan_rejected', 'invalid_ticket', diagnosticData, participant);
+      results.push(errorResult(item.clientId, 'invalid_ticket'));
+      continue;
     }
 
-    // Append data
-    const timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
-    sheet.appendRow([timestamp, data.uni, data.uuid]);
+    accepted.push({
+      clientId: item.clientId,
+      participantId: participant.id,
+      uuid: item.uuid,
+      timestamp: item.timestamp,
+      diagnosticData: diagnosticData,
+      participant: participant
+    });
+  }
 
-    return createResponse({ result: 'success', row: sheet.getLastRow() });
+  if (accepted.length === 0) {
+    return results;
+  }
 
-  } catch (err) {
-    return createResponse({ result: 'error', message: err.toString() });
+  // One duplicate pre-check covers every accepted scan in this batch,
+  // instead of one Raw_Scans read per scan.
+  const lastRowBeforeCheck = rawScanSheet.getLastRow();
+  const knownDuplicateKeys = loadKnownDuplicateKeys(rawScanSheet, accepted);
+  const pendingByKey = new Map();
+  const toWrite = [];
+  for (let a = 0; a < accepted.length; a += 1) {
+    const candidate = accepted[a];
+    const key = duplicateKey(candidate.participantId, candidate.uuid);
+    if (knownDuplicateKeys[key]) {
+      logDiagnostic('log', 'scan_duplicate', 'success', candidate.diagnosticData, candidate.participant);
+      results.push(successResult(candidate.clientId, true));
+    } else if (pendingByKey.has(key)) {
+      pendingByKey.get(key).duplicateClientIds.push(candidate.clientId);
+    } else {
+      candidate.duplicateClientIds = [];
+      pendingByKey.set(key, candidate);
+      toWrite.push(candidate);
+    }
+  }
+
+  if (toWrite.length === 0) {
+    return results;
+  }
+
+  const lock = LockService.getScriptLock();
+  try {
+    try {
+      lock.waitLock(LOCK_WAIT_MS);
+    } catch (lockError) {
+      for (let b = 0; b < toWrite.length; b += 1) {
+        logDiagnostic('warn', 'scan_rejected', 'server_busy', toWrite[b].diagnosticData, toWrite[b].participant);
+        addWriteResults(results, toWrite[b], 'server_busy');
+      }
+      return results;
+    }
+
+    try {
+      // Recheck the sheet if another request appended while we waited.
+      // An evicted cache entry cannot cause a duplicate write.
+      const confirmedDuplicates = rawScanSheet.getLastRow() === lastRowBeforeCheck
+        ? {}
+        : loadKnownDuplicateKeys(rawScanSheet, toWrite);
+      const rows = [];
+      const writtenCandidates = [];
+      for (let c = 0; c < toWrite.length; c += 1) {
+        const candidate = toWrite[c];
+        const key = duplicateKey(candidate.participantId, candidate.uuid);
+
+        if (confirmedDuplicates[key] || isDuplicateCached(key)) {
+          logDiagnostic('log', 'scan_duplicate', 'success', candidate.diagnosticData, candidate.participant);
+          addWriteResults(results, candidate, null, true);
+          continue;
+        }
+
+        rows.push([
+          new Date(candidate.timestamp),
+          neutralizeFormula(candidate.participantId),
+          neutralizeFormula(candidate.uuid)
+        ]);
+        writtenCandidates.push({ candidate: candidate, key: key });
+      }
+
+      if (rows.length > 0) {
+        const startRow = rawScanSheet.getLastRow() + 1;
+        rawScanSheet
+          .getRange(startRow, 1, rows.length, SCAN_HEADERS.RAW_SCANS.length)
+          .setValues(rows);
+        SpreadsheetApp.flush();
+      }
+
+      for (let w = 0; w < writtenCandidates.length; w += 1) {
+        markDuplicateCached(writtenCandidates[w].key);
+        addWriteResults(results, writtenCandidates[w].candidate, null, false);
+      }
+    } catch (writeError) {
+      const resolvedClientIds = Object.create(null);
+      for (let r = 0; r < results.length; r += 1) {
+        resolvedClientIds[results[r].client_id] = true;
+      }
+      for (let u = 0; u < toWrite.length; u += 1) {
+        if (!resolvedClientIds[toWrite[u].clientId]) {
+          logDiagnostic(
+            'error',
+            'scan_error',
+            'server_error',
+            toWrite[u].diagnosticData,
+            toWrite[u].participant,
+            String(writeError)
+          );
+          addWriteResults(results, toWrite[u], 'server_error');
+        }
+      }
+    }
   } finally {
     lock.releaseLock();
   }
+
+  return results;
+}
+
+function addWriteResults(results, candidate, errorCode, alreadyRecorded) {
+  const clientIds = [candidate.clientId].concat(candidate.duplicateClientIds);
+  clientIds.forEach(function(clientId, index) {
+    results.push(errorCode
+      ? errorResult(clientId, errorCode)
+      : successResult(clientId, alreadyRecorded || index > 0));
+  });
 }
 
 /**
- * Create a properly formatted response
+ * One Raw_Scans read (at most) covering every accepted scan in the batch,
+ * instead of one read per scan. Returns a map of duplicateKey -> true for
+ * every (participantId, uuid) pair already recorded, sourced from the
+ * cache where possible and the sheet otherwise. Matches found via a live
+ * read are cached for future requests.
  */
+function loadKnownDuplicateKeys(rawScanSheet, accepted) {
+  const known = {};
+  const uncachedKeys = [];
+  const keyToPair = {};
+
+  for (let i = 0; i < accepted.length; i += 1) {
+    const pair = accepted[i];
+    const key = duplicateKey(pair.participantId, pair.uuid);
+    if (isDuplicateCached(key)) {
+      known[key] = true;
+    } else if (!keyToPair[key]) {
+      keyToPair[key] = { participantId: pair.participantId, uuid: pair.uuid };
+      uncachedKeys.push(key);
+    }
+  }
+
+  if (uncachedKeys.length === 0) {
+    return known;
+  }
+
+  const existingRows = readDataRows(rawScanSheet, SCAN_HEADERS.RAW_SCANS.length);
+  const sheetKeys = {};
+  for (let r = 0; r < existingRows.length; r += 1) {
+    const rowKey = duplicateKey(
+      String(existingRows[r][1]),
+      String(existingRows[r][2]).trim().toUpperCase()
+    );
+    sheetKeys[rowKey] = true;
+  }
+
+  for (let u = 0; u < uncachedKeys.length; u += 1) {
+    const key = uncachedKeys[u];
+    if (sheetKeys[key]) {
+      known[key] = true;
+      markDuplicateCached(key);
+    }
+  }
+
+  return known;
+}
+
+function duplicateKey(participantId, uuid) {
+  return sha256Hex(String(participantId) + '\u0001' + String(uuid));
+}
+
+function isDuplicateCached(key) {
+  return CacheService.getScriptCache().get(DUPLICATE_CACHE_PREFIX + key) === '1';
+}
+
+function markDuplicateCached(key) {
+  CacheService.getScriptCache().put(DUPLICATE_CACHE_PREFIX + key, '1', DUPLICATE_CACHE_TTL_SECONDS);
+}
+
+/**
+ * Structured Executions logging for every scan outcome. Only non-sensitive
+ * protocol fields are ever included: participant ID, UUID, and the
+ * outcome code/event. Never pass the token, its hash, a Scanner_URL, or any
+ * registration PII into this function.
+ */
+function logDiagnostic(level, event, code, data, participant, message) {
+  const payload = {
+    event: event,
+    code: code
+  };
+
+  const participantId = (participant && participant.id) || (data && data.participant_id);
+  if (typeof participantId !== 'undefined') {
+    payload.participantId = participantId;
+  }
+  if (data && typeof data.uuid !== 'undefined') {
+    payload.uuid = data.uuid;
+  }
+  if (typeof message === 'string') {
+    payload.message = message;
+  }
+
+  const line = JSON.stringify(payload);
+  if (level === 'error') {
+    console.error(line);
+  } else if (level === 'warn') {
+    console.warn(line);
+  } else {
+    console.log(line);
+  }
+}
+
+function getConfiguredScanSpreadsheet() {
+  const spreadsheetId = PropertiesService
+    .getScriptProperties()
+    .getProperty(SCAN_SPREADSHEET_ID_PROPERTY);
+
+  if (!SPREADSHEET_ID_PATTERN.test(spreadsheetId || '')) {
+    throw new Error('Scanner workbook is not configured. Run setup first.');
+  }
+
+  // Bound-script active-file methods are unavailable in web-app executions.
+  // The organizer-run setup function records only the scanner workbook ID.
+  return SpreadsheetApp.openById(spreadsheetId);
+}
+
+function parsePostParameters(e) {
+  // Parse only the form body. Apps Script e.parameter also includes query strings.
+  const parameters = Object.create(null);
+  if (!/^application\/x-www-form-urlencoded(?:;|$)/i.test(e.postData.type || '')) {
+    return {};
+  }
+  try {
+    e.postData.contents.split('&').forEach(function(pair) {
+      const separator = pair.indexOf('=');
+      if (separator === -1) return;
+      const key = decodeURIComponent(pair.slice(0, separator).replace(/\+/g, ' '));
+      const value = decodeURIComponent(pair.slice(separator + 1).replace(/\+/g, ' '));
+      parameters[key] = value;
+    });
+  } catch (error) {
+    return {};
+  }
+  return {
+    participant_id: parameters.participant_id,
+    token: parameters.token,
+    uuid: parameters.uuid,
+    timestamp: parameters.timestamp
+  };
+}
+
+function requireSheetWithHeaders(spreadsheet, sheetName, requiredHeaders) {
+  const sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    throw new Error('Missing required scanner sheet: ' + sheetName);
+  }
+
+  const headers = sheet
+    .getRange(1, 1, 1, requiredHeaders.length)
+    .getValues()[0];
+
+  const validHeaders = requiredHeaders.every(function(requiredHeader, index) {
+    return headers[index] === requiredHeader;
+  });
+
+  if (!validHeaders) {
+    throw new Error('Invalid headers in scanner sheet: ' + sheetName);
+  }
+
+  return sheet;
+}
+
+/**
+ * Cached wrapper around findActiveParticipant. Caches both outcomes (found
+ * vs not-found/inactive) because participant_url is small and effectively
+ * static for the duration of an event. See PARTICIPANT_CACHE_TTL_SECONDS
+ * for the revocation/rotation tradeoff this implies.
+ */
+function findActiveParticipantCached(sheet, tokenHash, validationData) {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = PARTICIPANT_CACHE_PREFIX + tokenHash;
+  const cached = cache.get(cacheKey);
+  if (cached !== null) {
+    return cached === '' ? null : { id: cached };
+  }
+
+  const participant = findActiveParticipant(sheet, tokenHash, validationData);
+  cache.put(cacheKey, participant ? participant.id : '', PARTICIPANT_CACHE_TTL_SECONDS);
+  return participant;
+}
+
+function findActiveParticipant(sheet, tokenHash, validationData) {
+  let rows = validationData && validationData.participantRows;
+  if (!rows) {
+    rows = readDataRows(sheet, SCAN_HEADERS.PARTICIPANTS.length);
+    if (validationData) {
+      validationData.participantRows = rows;
+    }
+  }
+  const matchingRows = rows.filter(function(row) {
+    return typeof row[2] === 'string' &&
+      constantTimeEqual(row[2].toLowerCase(), tokenHash);
+  });
+
+  if (matchingRows.length > 1) {
+    throw new Error('Duplicate participant token hash');
+  }
+
+  if (matchingRows.length === 0 || !isActiveValue(matchingRows[0][3])) {
+    return null;
+  }
+
+  const participantId = matchingRows[0][1];
+  if (!isValidParticipantId(participantId)) {
+    throw new Error('Invalid configured participant ID');
+  }
+
+  return { id: participantId };
+}
+
+/**
+ * Cached wrapper around a valid_tickets lookup. Only ever caches a
+ * confirmed-true result, so a cache miss (never seen, or the entry
+ * expired) falls back to the request's lazily loaded ticket snapshot rather
+ * than trusting absence-from-cache as a rejection. Unknown tickets are not
+ * cached across requests, so a brand-new ticket is usable on the next
+ * request after it is added, without waiting for a negative-cache TTL.
+ */
+function isValidTicketCached(sheet, uuid, validationData) {
+  const cache = CacheService.getScriptCache();
+  const cacheKey = VALID_TICKET_CACHE_PREFIX + uuid;
+  if (cache.get(cacheKey) === '1') {
+    return true;
+  }
+
+  const found = ticketExists(sheet, uuid, validationData);
+  if (found) {
+    cache.put(cacheKey, '1', VALID_TICKET_CACHE_TTL_SECONDS);
+  }
+  return found;
+}
+
+function ticketExists(sheet, uuid, validationData) {
+  let ticketIds = validationData && validationData.ticketIds;
+  if (!ticketIds) {
+    ticketIds = new Set(readDataRows(sheet, SCAN_HEADERS.VALID_TICKETS.length)
+      .map(function(row) {
+        return String(row[0]).trim().toUpperCase();
+      }));
+    if (validationData) {
+      validationData.ticketIds = ticketIds;
+    }
+  }
+  return ticketIds.has(uuid);
+}
+
+function readDataRows(sheet, width) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    return [];
+  }
+  return sheet.getRange(2, 1, lastRow - 1, width).getValues();
+}
+
+function isActiveValue(value) {
+  return value === true ||
+    (typeof value === 'string' && value.trim().toUpperCase() === 'TRUE');
+}
+
+function sha256Hex(value) {
+  const digest = Utilities.computeDigest(
+    Utilities.DigestAlgorithm.SHA_256,
+    value,
+    Utilities.Charset.UTF_8
+  );
+
+  return digest.map(function(byte) {
+    return ((byte + 256) % 256).toString(16).padStart(2, '0');
+  }).join('');
+}
+
+function hashToken(token) {
+  return sha256Hex(token);
+}
+
+function constantTimeEqual(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') {
+    return false;
+  }
+
+  let difference = left.length ^ right.length;
+  const length = Math.max(left.length, right.length);
+  for (let index = 0; index < length; index += 1) {
+    difference |= (left.charCodeAt(index % left.length) || 0) ^
+      (right.charCodeAt(index % right.length) || 0);
+  }
+  return difference === 0;
+}
+
+function hasSpreadsheetFormulaPrefix(value) {
+  return typeof value === 'string' &&
+    /^'*[=+\-@\t\r\n\uFF1D\uFF0B\uFF0D\uFF20]/.test(value);
+}
+
+function isValidParticipantId(value) {
+  return typeof value === 'string' &&
+    value.length >= 1 &&
+    value.length <= MAX_PARTICIPANT_ID_LENGTH &&
+    value.trim() === value &&
+    !hasSpreadsheetFormulaPrefix(value) &&
+    !/[\u0000-\u001F\u007F<>:"\\|?*]/.test(value);
+}
+
+// Retain the old helper name for callers that used the previous custom-ID API.
+function isValidUniversityId(value) {
+  return isValidParticipantId(value);
+}
+
+function isValidTicketId(value) {
+  return typeof value === 'string' && TICKET_ID_PATTERN.test(value);
+}
+
+function isValidTimestamp(value) {
+  if (typeof value !== 'string' || !ISO_TIMESTAMP_PATTERN.test(value)) {
+    return false;
+  }
+  const parsed = new Date(value);
+  return !isNaN(parsed.getTime()) && parsed.toISOString() === value;
+}
+
+function neutralizeFormula(value) {
+  return hasSpreadsheetFormulaPrefix(value) ? "'" + value : value;
+}
+
 function createResponse(data) {
   return ContentService
     .createTextOutput(JSON.stringify(data))
@@ -94,18 +719,55 @@ function createResponse(data) {
 }
 
 /**
- * Run once to create the Raw_Scans sheet
+ * Run manually once after binding this project to the scanner workbook. Missing tabs
+ * are created, but existing non-empty tabs are never overwritten or repaired.
  */
 function setup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = ss.getSheetByName('Raw_Scans');
-  
-  if (!sheet) {
-    sheet = ss.insertSheet('Raw_Scans');
-    sheet.appendRow(['Timestamp', 'Uni_ID', 'UUID']);
-    sheet.getRange(1, 1, 1, 3).setFontWeight('bold');
-    Logger.log('Created Raw_Scans sheet');
-  } else {
-    Logger.log('Raw_Scans sheet exists');
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  if (!spreadsheet) {
+    throw new Error('Run setup from the Apps Script project bound to the scanner workbook.');
   }
+
+  const spreadsheetId = spreadsheet.getId();
+  if (!SPREADSHEET_ID_PATTERN.test(spreadsheetId || '')) {
+    throw new Error('Unable to determine a valid scanner workbook ID.');
+  }
+
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const configuredId = scriptProperties.getProperty(SCAN_SPREADSHEET_ID_PROPERTY);
+  if (configuredId && configuredId !== spreadsheetId) {
+    throw new Error('This Apps Script project is already configured for another workbook.');
+  }
+  scriptProperties.setProperty(SCAN_SPREADSHEET_ID_PROPERTY, spreadsheetId);
+
+  ensureAdministrativeSheet(
+    spreadsheet,
+    SCAN_SHEETS.RAW_SCANS,
+    SCAN_HEADERS.RAW_SCANS
+  );
+  ensureAdministrativeSheet(
+    spreadsheet,
+    SCAN_SHEETS.PARTICIPANTS,
+    SCAN_HEADERS.PARTICIPANTS
+  );
+  ensureAdministrativeSheet(
+    spreadsheet,
+    SCAN_SHEETS.VALID_TICKETS,
+    SCAN_HEADERS.VALID_TICKETS
+  );
+}
+
+function ensureAdministrativeSheet(spreadsheet, sheetName, headers) {
+  let sheet = spreadsheet.getSheetByName(sheetName);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(sheetName);
+  }
+
+  if (sheet.getLastRow() === 0) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+    return sheet;
+  }
+
+  return requireSheetWithHeaders(spreadsheet, sheetName, headers);
 }

@@ -1,195 +1,65 @@
 # traQRecord
 
-traQRecord is a reusable lead retrieval scaffold for education events, info sessions, fairs, partner visits, and similar check-in workflows. Each event gets its own Google Sheet and Google Apps Script Web App URL; the scanner app and post-event script are shared.
+traQRecord collects scans for education events, fairs and partner visits. Each event uses a registration workbook, a separate scanner workbook and an Apps Script deployment bound to the scanner workbook.
 
-Use `traQRecord` for product and user-facing branding. Use `traqrecord` for repository names, URLs, storage keys, and other technical identifiers.
+## Data flow
 
-## Architecture Overview
+1. The registration form sends the event fields to n8n. The workflow writes a complete registration with its ticket ID, then makes that ID available to the scanner and sends the matching QR code.
+2. An organizer creates a credentialed link for each organization. The browser queues scans offline and posts them to Apps Script when online. The receiver verifies the organization's credential and the ticket ID, then records one scan per organization and ticket.
+3. An organizer joins the two CSV exports locally by UUID and produces a report for each organization that scanned a registered lead.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         REGISTRATION PHASE                          │
-├─────────────────────────────────────────────────────────────────────┤
-│  User → CF7 Form → n8n generates ticket_id → Google Sheet + Email w/QR  │
-└─────────────────────────────────────────────────────────────────────┘
-                                  ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                           EVENT DAY                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│  Volunteer opens ?uni=BOOTH_A → Scans QR → localStorage → Sheet     │
-└─────────────────────────────────────────────────────────────────────┘
-                                  ↓
-┌─────────────────────────────────────────────────────────────────────┐
-│                          POST-EVENT                                  │
-├─────────────────────────────────────────────────────────────────────┤
-│  Download CSVs → Run Python script → leads_BOOTH_A.csv per booth    │
-└─────────────────────────────────────────────────────────────────────┘
-```
+## Set up an event
 
----
+### Registration workbook and n8n
 
-## Project Structure
+Keep the registration workbook restricted to the people and automation that need access to the full registration data. The registration export requires a unique `UUID` or `ticket_id` column. The current QR contract is eight uppercase alphanumeric characters.
 
-```
-traqrecord/
-├── index.html                    # Scanner PWA (deploy to GitHub Pages)
-├── Code.gs                       # Google Apps Script (deploy as Web App)
-├── email-templates/
-│   └── confirmation-email.html   # Email template with QR code
-├── scripts/
-│   └── process_leads.py          # Post-event lead splitting
-├── requirements.txt              # Python dependencies
-└── .gitignore
-```
+The DXJ China event workflow, `dxj-china-event`, already writes its generated `ticket_id` into `china-event-leads.UUID`. Its registration columns are `submission_time`, `full_name`, `email`, `phone`, `Age`, `consent`, `study-level`, `intake year` and `UUID`.
 
-## Setup Guide
+The published DXJ workflow includes `Save scanner ticket UUID` after the registration append. It upserts only `UUID` as raw text into `valid_tickets`. The confirmation path waits for the scanner write and receives the original registration item. At publication, the registration and scanner UUID lists matched across 84 existing tickets.
 
-### Phase 1: Registration System (WordPress & n8n)
+Avoid granting `IMPORTRANGE` access from the scanner workbook to the registration workbook. That grant would let scanner-workbook editors change the import range to read other registration columns. Keep the Apps Script scanner bound to its own data.
 
-#### 1.1 Send Data to n8n
-Configure your Contact Form 7 or WordPress integration to send a webhook to your n8n workflow when a user registers.
+### Scanner workbook
 
-#### 1.2 Generate Ticket ID
-Inside your n8n workflow, use a **Set node** after the webhook receives the data to generate a unique `ticket_id`. This uses the last 4 digits of the timestamp combined with 4 random alphanumeric characters:
+Create a restricted, separate Google Sheets file with these exact tab names and header rows.
 
-```javascript
-{{ $now.toMillis().toString().slice(-4) }}{{ Math.random().toString(36).substring(2, 6).toUpperCase() }}
+| Tab | Headers |
+| --- | --- |
+| `Raw_Scans` | `Timestamp`, `Uni_ID`, `UUID` |
+| `participant_url` | `Participant_Name`, `Participant_ID`, `Token_Hash`, `Active`, `Scanner_URL` |
+| `valid_tickets` | `UUID` |
+
+Keep ID columns formatted as plain text. Backfill only the IDs of registrations for the same event. A scanner URL contains a bearer credential. Share each link privately with its organization. Give workbook access to organizers and the automation account only as needed.
+
+### Apps Script and scanner deployment
+
+1. In the scanner workbook, open **Extensions → Apps Script**. Add `Code.gs` and `ParticipantLinks.gs`, then run `setup()` from the editor to validate the schema and record the workbook ID.
+2. Add each organization's name and distinct, stable ID in the first two columns of `participant_url`. Run `generateParticipantUrls()` from the editor. It fills the token hash, active flag and link for new rows and preserves links that already exist.
+3. Deploy the Apps Script as a Web App, executing as the owner, with access set to **Anyone**. The GET route is non-mutating. Scan uploads require both a matching active participant credential and a registered ticket.
+4. Set `API_URL` in `index.html` to this event's Web App `/exec` URL. Use a test deployment and follow [TESTING.md](TESTING.md) before publishing the scanner through GitHub Pages.
+5. Distribute the generated links. They use `?uni=<Participant_ID>#token=<credential>` on the traQRecord Pages URL. A bare `?uni=` link cannot open the scanner. Set `Active` to false to disable a link or run `rotateSelectedParticipantUrl()` with one participant row selected. Cached authorization can persist for up to 60 seconds.
+
+Before replacing an older deployed scanner, confirm its devices have synchronized any pending scans. The new offline queue is scoped to the deployment and participant and keeps the credential in the link. Keep the old export available if you need to recover historical scans.
+
+## Export leads
+
+Export the registration tab as `registrations.csv` and the same event's scanner `Raw_Scans` tab as `raw_scans.csv`. Keep both exports and the resulting lead reports in restricted storage. `participant_url` and `valid_tickets` are used by the scanner only.
+
+```powershell
+python -m pip install --require-hashes -r requirements.lock
+python scripts/process_leads.py registrations.csv raw_scans.csv --output-dir reports/dxj-china
 ```
 
-#### 1.3 Update Google Sheets
-Send the user's registration details along with the newly generated `ticket_id` to your Google Sheet. Your sheet should have these columns:
-| full_name | email | phone | school | Grade | intake_year | consent_text | submission_time | ticket_id |
-|-----------|-------|-------|--------|-------|-------------|--------------|-----------------|-----------|
+Without arguments, the script reads `registrations.csv` and `raw_scans.csv` and writes to `reports`. Use a fresh output directory per event or export run so files from an earlier run do not get mixed with the current results.
 
-#### 1.4 Configure Confirmation Email
-In your n8n email node, generate the dynamic QR code image using QuickChart.io by injecting the `ticket_id` into the URL:
+Each CSV contains one row per matched UUID scanned by that organization. The same lead can appear in multiple organization files if each of those organizations scanned the lead. The script omits unmatched scans and reports their count. It stops on conflicting registration records for one UUID. It keeps the existing report labels for common fields, appends custom registration fields and preserves text such as leading zeros. Formula-shaped input values are escaped for opening the CSVs in a spreadsheet.
 
-```html
-<img src="https://quickchart.io/qr?text={{ $json.ticket_id }}&size=250" alt="QR Code" />
-```
+## Repository
 
-See `email-templates/confirmation-email.html` for a full template.
-
----
-
-### Phase 2: Scanner App (Event Day)
-
-#### 2.1 Deploy Google Apps Script
-
-1. Open your Google Sheet
-2. **Extensions → Apps Script**
-3. Paste contents of `Code.gs`
-4. **Deploy → New deployment → Web App**
-   - Execute as: Me
-   - Access: Anyone
-5. Copy the Web App URL
-
-#### 2.2 Configure the Scanner for the Event
-
-Each event has its own Google Sheet and therefore its own Web App URL.
-
-1. Open `index.html`
-2. Replace `API_URL` with the current event's Google Apps Script Web App URL
-3. Commit and push to GitHub
-
-GitHub Pages serves the latest commit, so updating the URL redeploys instantly.
-
-#### 2.3 Rename the GitHub Pages Path
-
-The GitHub Pages project URL includes the repository name. Keep the repository name neutral so public links do not mention a past event.
-
-Recommended repo name:
-
-```
-traqrecord
-```
-
-Expected project URL after the GitHub repository is renamed:
-
-```
-https://givi-guntsadze.github.io/traqrecord/
-```
-
-#### 2.4 Create Booth Links
-
-Booth links use the `?uni=` parameter to tag each scan with the scanning institution:
-
-| Event | Booth or institution | URL |
-|-------|----------------------|-----|
-| Current event | Booth A | `https://givi-guntsadze.github.io/traqrecord/?uni=BOOTH_A` |
-| Current event | General desk | `https://givi-guntsadze.github.io/traqrecord/?uni=GENERAL` |
-
----
-
-### Phase 3: Post-Event Processing
-
-#### 3.1 Export Data
-
-Each event has its own Google Sheet. Export from the correct sheet for the event you're processing:
-
-1. From the event's Registration Sheet → Download as `registrations.csv`
-2. From the same sheet's `Raw_Scans` tab → Download as `raw_scans.csv`
-
-Place both files in the project root.
-
-#### 3.2 Run the Script
-
-```bash
-# Install dependencies (first time only; hash-locked)
-pip install --require-hashes -r requirements.lock
-
-# Process leads (default: reads registrations.csv + raw_scans.csv)
-python scripts/process_leads.py
-
-# Or pass filenames explicitly
-python scripts/process_leads.py registrations.csv Raw_Scans.csv
-```
-
-Dependencies (updated 2026-11-18): `requirements.txt` holds the human-edited ranges (`pandas>=2.0.0`); `requirements.lock` is the hash-locked install set generated from it with `pip-compile --generate-hashes --strip-extras --allow-unsafe --output-file requirements.lock requirements.txt` on Python 3.12 (pandas 3.1.1, numpy 2.5.5). pandas 3 was tested against pandas 2.3.3 on real event data and produced byte-identical reports, so no upper bound is set. After editing `requirements.txt`, recompile the lock and re-run the script.
-
-#### 3.3 Output
-
-One CSV per `Uni_ID` value found in the scans. `Uni_ID` is the historical column name; it can represent a university, booth, partner, counselor, or general scanning station.
-
-```
-reports/
-├── leads_BOOTH_A.csv
-├── leads_GENERAL.csv
-└── leads_<UNI_ID>.csv
-```
-
-#### 3.4 Registration Column Flexibility
-
-Different events may use different form field names. `process_leads.py` normalizes common variations automatically. Supported aliases (all case-insensitive):
-
-| Form field name(s) | Normalized to |
-|--------------------|---------------|
-| `fullName`, `fullname`, `name`, `full_name` | `fullName` in output |
-| `email` | `email` |
-| `phone` | `Phone` |
-| `school` | `School` |
-| `grade`, `Grade` | `Grade` |
-| `intake_year`, `intake year` | `intake_year` |
-| `consent`, `consent_text` | `consent` |
-| `time`, `submission_time` | `time` |
-| `UUID`, `ticket_id`, `uuid` | join key (not in output) |
-
-Columns not in this list are collected but excluded from the output CSV. If a field is missing from the registration form entirely, that column is simply absent from the report.
-
----
-
-## Testing
-
-See [TESTING.md](TESTING.md) for:
-- Automated test results
-- Manual testing steps
-- Troubleshooting guide
-
----
-
-## Key Features
-
-- **Offline-First**: Scans saved to device, sync when online
-- **Concurrent-Safe**: LockService handles 30+ simultaneous writers
-- **Zero Server Cost**: GitHub Pages + Google Sheets
-- **Dynamic QR**: No image storage, QuickChart renders on-the-fly
+- `index.html` is the GitHub Pages scanner.
+- `Code.gs` receives and verifies scans.
+- `ParticipantLinks.gs` generates and rotates organization scanner links.
+- `scripts/process_leads.py` joins the CSVs and creates organization reports.
+- `requirements.txt` declares Python dependencies. `requirements.lock` pins the hash-verified install.
+- `email-templates/confirmation-email.html` is a starter template for the QR confirmation.

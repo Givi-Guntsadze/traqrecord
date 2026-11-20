@@ -3,9 +3,10 @@
 
 <head>
     <meta charset="UTF-8">
+    <meta name="referrer" content="no-referrer">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>traQRecord</title>
-    <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+    <script src="vendor/html5-qrcode.min.js"></script>
     <style>
         :root {
             --primary: #3b82f6;
@@ -198,6 +199,9 @@
             font-weight: 700;
             color: white;
         }
+        .pending-count.has-rejected, .scan-reason { color: #9a031e; }
+        .scan-reason { font-size: 0.8rem; }
+        .scan-icon.rejected { background: #9a031e; }
     </style>
 </head>
 
@@ -234,36 +238,100 @@
 
     <script>
         // =====================================================
-        // CONFIGURATION - Paste the current event's Google Apps Script Web App URL here.
+        // CONFIGURATION - scanner workbook Apps Script web app
         // =====================================================
-        const API_URL = "https://script.google.com/macros/s/AKfycbwioi1EbRMauKJ7jX2qzFM7T-bt9iGh92LeIshJdLAai4G84BDMJEYKzR3av0DxLMCG8A/exec";
+        const UNCONFIGURED_API_URL = 'UNCONFIGURED_SCAN_WEB_APP_URL';
+        const API_URL = 'https://script.google.com/macros/s/AKfycbxpZD36eUWbOUIJF70DZmW7YCb-rQivnuyoH1lTF1Vc39iPQ0Yv2yJHVE2r7ZGSMkBC/exec';
+        // Keep these constraints in sync with Code.gs. The server remains the
+        // security boundary; client validation avoids unsafe/stuck queue items.
+        const MAX_UNIVERSITY_ID_LENGTH = 50;
+        const TICKET_ID_PATTERN = /^[A-Z0-9]{8}$/;
+        const TOKEN_PATTERN = /^[a-f0-9]{64}$/;
+        const ISO_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+        // Up to this many pending scans are sent per sync request, so a
+        // volunteer scanning several visitors back-to-back produces one
+        // request instead of one per visitor. Matches the backend's
+        // MAX_BATCH_SIZE in Code.gs.
+        const SYNC_BATCH_SIZE = 10;
+
+        // A single sync request can never block the sync loop longer than
+        // this. Chosen to comfortably cover normal Apps Script latency
+        // (including a cold start) while still being short enough that a
+        // genuinely stuck request clears in well under the next 5-second
+        // retry tick rather than hanging indefinitely.
+        const SYNC_REQUEST_TIMEOUT_MS = 9000;
+        const PERMANENT_ERROR_CODES = new Set([
+            'unauthorized',
+            'invalid_request',
+            'invalid_ticket'
+        ]);
+
+        const REJECTION_MESSAGES = {
+            unauthorized: 'Rejected - institution link unauthorized',
+            invalid_request: 'Rejected - invalid scan request',
+            invalid_ticket: 'Rejected - UUID not found in valid tickets'
+        };
+
+        const TRANSIENT_MESSAGES = {
+            server_busy: 'Pending - server busy, retrying',
+            server_error: 'Pending - temporary server error, retrying',
+            network: 'Pending - waiting for connection, retrying'
+        };
+
+        function getReasonText(scan) {
+            if (!scan) return '';
+            if (scan.status === 'rejected') {
+                return REJECTION_MESSAGES[scan.rejectionCode] || 'Rejected';
+            }
+            if (scan.status === 'pending' && scan.transientCode) {
+                return TRANSIENT_MESSAGES[scan.transientCode] || '';
+            }
+            return '';
+        }
+
         // =====================================================
 
         // --- STATE ---
-        const STORAGE_KEY = 'traqrecord_scan_queue';
-        let scanQueue = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
         let isOnline = navigator.onLine;
         let isSyncing = false;
         let html5QrCode = null;
 
-        // --- Get booth/institution ID from URL. Keep `uni` for URL compatibility. ---
+        // --- Get participant identity and bearer credential from URL ---
         const urlParams = new URLSearchParams(window.location.search);
+        const fragmentParams = new URLSearchParams(window.location.hash.slice(1));
         const UNI_ID = urlParams.get('uni');
+        const PARTICIPANT_TOKEN = fragmentParams.get('token');
 
-        if (!UNI_ID) {
-            document.body.innerHTML = `
-        <div style="padding: 40px; text-align: center;">
-            <h1 style="color: #ef4444;">Configuration Error</h1>
-            <p style="color: #94a3b8; margin-top: 16px;">
-                Missing <code>?uni=NAME</code> in URL.<br><br>
-                Example: <code>yoursite.com/traqrecord/?uni=BOOTH_A</code>
-            </p>
-        </div>
-    `;
-            throw new Error("Missing uni parameter");
+        window.addEventListener('hashchange', () => {
+            const currentToken = new URLSearchParams(window.location.hash.slice(1)).get('token');
+            if (currentToken !== PARTICIPANT_TOKEN) window.location.reload();
+        });
+
+        if (!isValidUniversityId(UNI_ID) ||
+            !TOKEN_PATTERN.test(PARTICIPANT_TOKEN || '') ||
+            !isConfiguredApiUrl(API_URL)) {
+            renderConfigurationError();
+            throw new Error('Invalid participant link or scanner deployment configuration');
         }
 
+
+        // Each deployment accepts scans only for its own event and participant.
+        const STORAGE_KEY = ['traqrecord_scan_queue', API_URL, UNI_ID].join(':');
+        let scanQueue = loadQueue();
         document.getElementById('uni-name').textContent = UNI_ID;
+
+        function renderConfigurationError() {
+            document.body.innerHTML = `
+                <div style="padding: 40px; text-align: center; font-family: ui-monospace, 'Cascadia Code', 'Segoe UI Mono', 'Roboto Mono', Menlo, Consolas, 'Courier New', monospace;">
+                    <div style="font-size: 0.75rem; font-weight: 800; letter-spacing: 0.04em; color: #e36414;">traQRecord</div>
+                    <h1 style="color: #9a031e; margin-top: 8px;">Configuration Error</h1>
+                    <p style="color: #6b6b6b; margin-top: 16px;">
+                        This participant scanner link is missing, invalid, or not deployed yet.
+                    </p>
+                </div>
+            `;
+        }
 
         // --- NETWORK STATUS ---
         function updateNetworkStatus() {
@@ -281,8 +349,84 @@
         window.addEventListener('offline', () => { isOnline = false; updateNetworkStatus(); });
 
         // --- QUEUE MANAGEMENT ---
+        function loadQueue() {
+            try {
+                const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+                if (!Array.isArray(stored)) return [];
+                return stored.map(normalizeStoredScan).filter(Boolean);
+            } catch (error) {
+                console.warn('Stored scan queue was reset because it was invalid');
+                return [];
+            }
+        }
+
+        function normalizeStoredScan(scan) {
+            if (!scan || typeof scan !== 'object') return null;
+
+            const uuid = typeof scan.uuid === 'string' ? scan.uuid : '';
+            const timestamp = isValidTimestamp(scan.timestamp)
+                ? scan.timestamp
+                : new Date(0).toISOString();
+            let status = ['pending', 'synced', 'rejected'].includes(scan.status)
+                ? scan.status
+                : 'rejected';
+
+            if (status === 'pending' &&
+                (!isValidTicketId(uuid) || !isValidTimestamp(scan.timestamp))) {
+                status = 'rejected';
+            }
+
+            return {
+                id: isValidScanId(scan.id) ? scan.id : generateScanId(),
+                uuid,
+                timestamp,
+                status,
+                rejectionCode: status === 'rejected' && typeof scan.rejectionCode === 'string'
+                    ? scan.rejectionCode
+                    : '',
+                transientCode: status === 'pending' && typeof scan.transientCode === 'string'
+                    ? scan.transientCode
+                    : ''
+            };
+        }
+
         function saveQueue() {
             localStorage.setItem(STORAGE_KEY, JSON.stringify(scanQueue));
+        }
+
+        function hasSpreadsheetFormulaPrefix(value) {
+            return typeof value === 'string' &&
+                /^'*[=+\-@\t\r\n\uFF1D\uFF0B\uFF0D\uFF20]/.test(value);
+        }
+
+        function isValidUniversityId(value) {
+            return typeof value === 'string' &&
+                value.length >= 1 &&
+                value.length <= MAX_UNIVERSITY_ID_LENGTH &&
+                value.trim() === value &&
+                !hasSpreadsheetFormulaPrefix(value) &&
+                !/[\u0000-\u001F\u007F<>:"\\|?*]/.test(value);
+        }
+
+        function isValidTicketId(value) {
+            return typeof value === 'string' && TICKET_ID_PATTERN.test(value);
+        }
+
+        function isValidTimestamp(value) {
+            if (typeof value !== 'string' || !ISO_TIMESTAMP_PATTERN.test(value)) {
+                return false;
+            }
+            const parsed = new Date(value);
+            return !Number.isNaN(parsed.getTime()) && parsed.toISOString() === value;
+        }
+
+        function isValidScanId(value) {
+            return typeof value === 'string' && /^[A-Za-z0-9-]{1,100}$/.test(value);
+        }
+
+        function isConfiguredApiUrl(value) {
+            return value !== UNCONFIGURED_API_URL &&
+                /^https:\/\/script\.google\.com\/macros\/s\/[A-Za-z0-9_-]+\/exec$/.test(value);
         }
 
         function generateScanId() {
@@ -294,18 +438,22 @@
         }
 
         function addToQueue(uuid) {
-            // Prevent duplicate UUIDs (same person scanned twice in quick succession)
-            if (scanQueue.some(s => s.uuid === uuid)) {
-                console.log('Duplicate scan ignored:', uuid);
+            // Avoid local duplicates for the same participant. Server-side
+            // idempotency remains authoritative across devices and retries.
+            if (scanQueue.some(scan =>
+                scan.uuid === uuid
+            )) {
+                console.log('Duplicate scan ignored');
                 return null;
             }
 
             const scanData = {
                 id: generateScanId(),
-                uni: UNI_ID,
                 uuid: uuid,
                 timestamp: new Date().toISOString(),
-                status: 'pending' // pending | synced
+                status: 'pending',
+                rejectionCode: '',
+                transientCode: ''
             };
 
             scanQueue.push(scanData);
@@ -313,10 +461,12 @@
             return scanData;
         }
 
-        function markSynced(id) {
+        function markScanStatus(id, status, code) {
             const scan = scanQueue.find(s => s.id === id);
             if (scan) {
-                scan.status = 'synced';
+                scan.status = status;
+                scan.rejectionCode = status === 'rejected' && typeof code === 'string' ? code : '';
+                scan.transientCode = status === 'pending' && typeof code === 'string' ? code : '';
                 saveQueue();
             }
         }
@@ -325,52 +475,156 @@
             return scanQueue.filter(s => s.status === 'pending').length;
         }
 
+        function getRejectedCount() {
+            return scanQueue.filter(s => s.status === 'rejected').length;
+        }
+
         // --- SYNC LOGIC ---
+        //
+        // SYNC_BATCH_SIZE bounds one HTTP request, never the queue itself:
+        // sync() loops, draining one batch after another with no wait and no
+        // volunteer action in between, until either the pending queue is
+        // empty or a batch comes back with a transient outcome (network
+        // failure, timeout, or a server_busy/server_error result for one of
+        // its scans). At that point the drain stops early — everything
+        // still pending is left exactly as-is and is retried automatically
+        // by the next tick or the next triggered sync, never lost and never
+        // requiring the volunteer to do anything but keep scanning. Each
+        // request carries a bounded, finite timeout (SYNC_REQUEST_TIMEOUT_MS)
+        // via AbortController so a single slow or hung request can never
+        // block the drain indefinitely — a timeout is treated exactly like a
+        // network failure: the affected scans stay pending.
+        //
+        // A scan is only ever marked synced/rejected after its own
+        // individual server result is known; being included in a request
+        // body never by itself changes its status.
+        function markBatchPending(batch, transientCode) {
+            for (const scan of batch) {
+                markScanStatus(scan.id, 'pending', transientCode);
+                updateScanItemUI(scan.id, 'pending');
+            }
+        }
+
+        // Sends exactly one batch and applies each scan's individual
+        // result. Returns true if any scan in the batch ended up
+        // transiently pending, which tells the caller it is not safe to
+        // immediately send another batch.
+        async function sendBatch(batch) {
+            const payload = JSON.stringify({
+                scans: batch.map(scan => ({
+                    client_id: scan.id,
+                    participant_id: UNI_ID,
+                    token: PARTICIPANT_TOKEN,
+                    uuid: scan.uuid,
+                    timestamp: scan.timestamp
+                }))
+            });
+
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), SYNC_REQUEST_TIMEOUT_MS);
+
+            let response;
+            try {
+                response = await fetch(API_URL, {
+                    method: 'POST',
+                    headers: {
+                        // Apps Script parses JSON; this type avoids OPTIONS preflight.
+                        'Content-Type': 'text/plain;charset=UTF-8'
+                    },
+                    body: payload,
+                    credentials: 'omit',
+                    redirect: 'follow',
+                    referrerPolicy: 'no-referrer',
+                    signal: controller.signal
+                });
+            } catch (error) {
+                // Do not log the Error object: network libraries can
+                // include the credential-bearing request body in it.
+                // This also covers an AbortController timeout, which
+                // must never be treated as a permanent rejection.
+                console.error('Scan synchronization failed');
+                markBatchPending(batch, 'network');
+                return true;
+            } finally {
+                clearTimeout(timeoutId);
+            }
+
+            if (!response.ok) {
+                markBatchPending(batch, 'network');
+                return true;
+            }
+
+            const body = await response.json().catch(() => null);
+            const resultsByClientId = new Map();
+            if (body && Array.isArray(body.results)) {
+                for (const item of body.results) {
+                    if (item && typeof item.client_id === 'string') {
+                        resultsByClientId.set(item.client_id, item);
+                    }
+                }
+            }
+
+            let hadTransient = false;
+
+            for (const scan of batch) {
+                const result = resultsByClientId.get(scan.id);
+                if (!result) {
+                    // No matching result for this scan: treat as a
+                    // transient server issue rather than guessing.
+                    markScanStatus(scan.id, 'pending', 'server_error');
+                    updateScanItemUI(scan.id, 'pending');
+                    hadTransient = true;
+                    continue;
+                }
+
+                if (result.result === 'success') {
+                    markScanStatus(scan.id, 'synced');
+                    updateScanItemUI(scan.id, 'synced');
+                    continue;
+                }
+
+                if (PERMANENT_ERROR_CODES.has(result.code)) {
+                    markScanStatus(scan.id, 'rejected', result.code);
+                    updateScanItemUI(scan.id, 'rejected');
+                    continue;
+                }
+
+                // Busy, malformed, and internal-error responses are
+                // transient. Leave this scan pending for a later retry.
+                const transientCode = result.code === 'server_busy' ? 'server_busy' : 'server_error';
+                markScanStatus(scan.id, 'pending', transientCode);
+                updateScanItemUI(scan.id, 'pending');
+                hadTransient = true;
+            }
+
+            return hadTransient;
+        }
+
         async function sync() {
             if (isSyncing || !isOnline) return;
-
-            const pending = scanQueue.filter(s => s.status === 'pending');
-            if (pending.length === 0) return;
+            if (getPendingCount() === 0) return;
 
             isSyncing = true;
             updateUI();
 
-            for (const scan of pending) {
-                try {
-                    // Use GET with URL parameters - more reliable with Google Apps Script
-                    const params = new URLSearchParams({
-                        uni: scan.uni,
-                        uuid: scan.uuid,
-                        timestamp: scan.timestamp
-                    });
+            try {
+                while (isOnline) {
+                    const batch = scanQueue.filter(s => s.status === 'pending').slice(0, SYNC_BATCH_SIZE);
+                    if (batch.length === 0) break;
 
-                    const response = await fetch(`${API_URL}?${params.toString()}`, {
-                        method: 'GET',
-                        redirect: 'follow'
-                    });
-
-                    // Check if we got a valid response
-                    if (response.ok) {
-                        const result = await response.json();
-                        if (result.result === 'success') {
-                            markSynced(scan.id);
-                            updateScanItemUI(scan.id, 'synced');
-                        } else {
-                            console.error('Sync error:', result.message);
-                        }
-                    }
-                } catch (error) {
-                    console.error('Sync failed for', scan.uuid, error);
-                    // Stop trying on network error
-                    break;
+                    const hadTransient = await sendBatch(batch);
+                    if (hadTransient) break;
                 }
+            } finally {
+                isSyncing = false;
+                updateUI();
             }
-
-            isSyncing = false;
-            updateUI();
         }
 
-        // Auto-retry sync every 5 seconds
+        // Auto-retry every 5 seconds in case a previous drain stopped early
+        // on a transient failure (network issue, timeout, server_busy).
+        // While online with no transient failures, sync() itself already
+        // drains the entire queue across as many batches as it takes.
         setInterval(() => {
             if (isOnline && getPendingCount() > 0) {
                 sync();
@@ -382,15 +636,21 @@
 
         // --- UI UPDATES ---
         function updateUI() {
-            const count = getPendingCount();
+            const pendingCount = getPendingCount();
+            const rejectedCount = getRejectedCount();
             const countEl = document.getElementById('pending-count');
             const btnEl = document.getElementById('sync-btn');
 
-            if (count > 0) {
-                countEl.textContent = `${count} pending upload${count > 1 ? 's' : ''}`;
+            if (pendingCount > 0) {
+                countEl.textContent = `${pendingCount} pending upload${pendingCount > 1 ? 's' : ''}`;
                 countEl.className = 'pending-count has-pending';
                 btnEl.disabled = isSyncing;
                 btnEl.textContent = isSyncing ? 'Syncing...' : 'Sync Now';
+            } else if (rejectedCount > 0) {
+                countEl.textContent = `${rejectedCount} rejected scan${rejectedCount > 1 ? 's' : ''}`;
+                countEl.className = 'pending-count has-rejected';
+                btnEl.disabled = true;
+                btnEl.textContent = 'Sync Now';
             } else {
                 countEl.textContent = 'All synced';
                 countEl.className = 'pending-count';
@@ -409,13 +669,34 @@
             const li = document.createElement('li');
             li.className = 'scan-item';
             li.id = `scan-${scanData.id}`;
-            li.innerHTML = `
-        <span class="scan-icon ${scanData.status}"></span>
-        <div class="scan-info">
-            <div class="scan-uuid">${scanData.uuid}</div>
-            <div class="scan-time">${new Date(scanData.timestamp).toLocaleTimeString()}</div>
-        </div>
-    `;
+
+            const icon = document.createElement('span');
+            const displayStatus = ['synced', 'rejected'].includes(scanData.status)
+                ? scanData.status
+                : 'pending';
+            icon.className = `scan-icon ${displayStatus}`;
+
+            const info = document.createElement('div');
+            info.className = 'scan-info';
+
+            const uuid = document.createElement('div');
+            uuid.className = 'scan-uuid';
+            uuid.textContent = scanData.uuid;
+
+            const time = document.createElement('div');
+            time.className = 'scan-time';
+            time.textContent = new Date(scanData.timestamp).toLocaleTimeString();
+
+            info.appendChild(uuid);
+            info.appendChild(time);
+
+            const reason = document.createElement('div');
+            reason.className = 'scan-reason';
+            reason.textContent = getReasonText(scanData);
+            info.appendChild(reason);
+
+            li.appendChild(icon);
+            li.appendChild(info);
             list.prepend(li);
         }
 
@@ -423,19 +704,37 @@
             const item = document.getElementById(`scan-${id}`);
             if (item) {
                 const icon = item.querySelector('.scan-icon');
-                icon.className = `scan-icon ${status}`;
+                if (icon) {
+                    icon.className = `scan-icon ${status}`;
+                }
+                const reason = item.querySelector('.scan-reason');
+                if (reason) {
+                    const scan = scanQueue.find(s => s.id === id);
+                    reason.textContent = getReasonText(scan);
+                }
             }
         }
 
-        function showFlash() {
+        function showFlash(message, tone) {
             const overlay = document.getElementById('flash-overlay');
+            const textEl = overlay.querySelector('.flash-text');
+            if (textEl) {
+                textEl.textContent = typeof message === 'string' && message ? message : '✓ Saved!';
+            }
+            overlay.classList.remove('tone-warning', 'tone-duplicate');
+            if (tone === 'warning' || tone === 'duplicate') {
+                overlay.classList.add(`tone-${tone}`);
+            }
             overlay.classList.add('show');
             setTimeout(() => overlay.classList.remove('show'), 300);
         }
 
-        // --- SCANNER ---
         function onScanSuccess(decodedText) {
-            // Add to queue
+            if (!isValidTicketId(decodedText)) {
+                console.warn('Invalid ticket identifier ignored');
+                return;
+            }
+
             const scanData = addToQueue(decodedText);
 
             if (scanData) {
@@ -446,6 +745,8 @@
 
                 // Try to sync immediately
                 sync();
+            } else {
+                showFlash('Already scanned', 'duplicate');
             }
         }
 
@@ -455,6 +756,7 @@
 
         // --- INIT ---
         function init() {
+            saveQueue();
             updateNetworkStatus();
             updateUI();
 
@@ -465,13 +767,20 @@
             html5QrCode = new Html5Qrcode("reader");
             html5QrCode.start(
                 { facingMode: "environment" },
-                { fps: 10, qrbox: { width: 250, height: 250 } },
+                {
+                    fps: 10,
+                    qrbox: (viewfinderWidth, viewfinderHeight) => {
+                        const edge = Math.min(viewfinderWidth, viewfinderHeight);
+                        const size = Math.floor(edge * 0.7);
+                        return { width: size, height: size };
+                    }
+                },
                 onScanSuccess,
                 onScanFailure
             ).catch(err => {
                 console.error("Camera error:", err);
                 document.getElementById('reader').innerHTML = `
-            <div style="padding: 40px; text-align: center; color: #ef4444;">
+            <div style="padding: 40px; text-align: center; color: #ffb4c0; font-family: ui-monospace, 'Cascadia Code', 'Segoe UI Mono', 'Roboto Mono', Menlo, Consolas, 'Courier New', monospace;">
                 Camera access denied or unavailable.<br>
                 Please allow camera permissions.
             </div>

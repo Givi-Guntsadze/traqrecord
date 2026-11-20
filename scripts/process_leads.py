@@ -1,220 +1,167 @@
-"""
-traQRecord - Post-Event Processing Script
-=========================================
-This script performs the "Split & Delivery" operation after the event ends.
+"""Join registration and scan CSVs by ticket ID and split leads by organization."""
 
-INPUTS:
-  - registrations.csv: Export from your "Lead Registrations" Google Sheet
-  - raw_scans.csv: Export from the "Raw_Scans" tab
-
-OUTPUT:
-  - leads_BOOTH_A.csv, leads_BOOTH_B.csv, etc. (one per booth/institution)
-"""
+import argparse
+import re
+from pathlib import Path
+from urllib.parse import quote
 
 import pandas as pd
-import os
-import sys
+
 
 REGISTRATION_COLUMN_ALIASES = {
-    'full_name': 'full_name',
-    'fullname': 'full_name',
-    'name': 'full_name',
-    'email': 'email',
-    'phone': 'phone',
-    'school': 'school',
-    'grade': 'Grade',
-    'age': 'Age',
-    'intake_year': 'intake_year',
-    'consent_text': 'consent_text',
-    'consent': 'consent_text',
-    'submission_time': 'submission_time',
-    'time': 'submission_time',
+    "full_name": "full_name",
+    "fullname": "full_name",
+    "name": "full_name",
+    "email": "email",
+    "phone": "phone",
+    "school": "school",
+    "grade": "Grade",
+    "age": "Age",
+    "intake_year": "intake_year",
+    "consent_text": "consent_text",
+    "consent": "consent_text",
+    "submission_time": "submission_time",
+    "time": "submission_time",
 }
 
 REPORT_COLUMN_LABELS = {
-    'full_name': 'fullName',
-    'school': 'School',
-    'Grade': 'Grade',
-    'Age': 'Age',
-    'phone': 'Phone',
-    'email': 'email',
-    'intake_year': 'intake_year',
-    'consent_text': 'consent',
-    'submission_time': 'time',
-    'UUID': 'UUID',
+    "full_name": "fullName",
+    "school": "School",
+    "Grade": "Grade",
+    "Age": "Age",
+    "phone": "Phone",
+    "email": "email",
+    "intake_year": "intake_year",
+    "consent_text": "consent",
+    "submission_time": "time",
+    "UUID": "UUID",
 }
 
-def load_data(reg_file: str, scans_file: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load and validate the input CSV files."""
-    
-    # Check files exist
-    if not os.path.exists(reg_file):
-        print(f"ERROR: {reg_file} not found")
-        print("   Export your Registration Sheet from Google Sheets as CSV")
-        sys.exit(1)
-        
-    if not os.path.exists(scans_file):
-        print(f"ERROR: {scans_file} not found")
-        print("   Export the Raw_Scans tab from Google Sheets as CSV")
-        sys.exit(1)
-    
-    registrations = pd.read_csv(reg_file)
-    scans = pd.read_csv(scans_file)
-    
-    print(f"Loaded {len(registrations)} registrations")
-    print(f"Loaded {len(scans)} scans")
-    
-    return registrations, scans
+TICKET_COLUMN_ALIASES = ("uuid", "ticket_id", "ticketid", "id")
+FORMULA_PREFIX = re.compile(r"^\s*['\s]*[=+\-@＝＋－＠]|^[\t\r\n]")
+PLAIN_NUMBER = re.compile(r"[+-][0-9]+(?:\.[0-9]+)?")
 
-def clean_data(registrations: pd.DataFrame, scans: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Standardize column names and clean data."""
-    
-    # Normalize column names (strip whitespace, lowercase)
-    registrations.columns = registrations.columns.str.strip()
-    scans.columns = scans.columns.str.strip()
-    
-    # Find the UUID column in registrations (might be 'ticket_id', 'UUID', 'uuid', etc.)
-    uuid_col = None
-    for col in registrations.columns:
-        if col.lower() in ['ticket_id', 'uuid', 'ticketid', 'id']:
-            uuid_col = col
-            break
-    
-    if not uuid_col:
-        print("ERROR: Could not find UUID column in registrations")
-        print(f"   Available columns: {list(registrations.columns)}")
-        sys.exit(1)
-    
-    # Standardize UUID column name
-    registrations = registrations.rename(columns={uuid_col: 'UUID'})
 
-    normalized_names: dict[str, str] = {}
-    for col in registrations.columns:
-        normalized = col.strip().lower().replace(' ', '_')
-        canonical = REGISTRATION_COLUMN_ALIASES.get(normalized)
-        if canonical and canonical not in registrations.columns:
-            normalized_names[col] = canonical
+def load_csv(path: Path) -> pd.DataFrame:
+    """Keep ticket IDs, phone numbers, empty fields and event answers as text."""
+    data = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    data.columns = data.columns.str.strip()
+    if data.columns.has_duplicates:
+        raise ValueError(f"{path.name} has duplicate column headers.")
+    return data.replace("\ufffd", "", regex=True)
 
-    if normalized_names:
-        registrations = registrations.rename(columns=normalized_names)
-    
-    # Ensure UUID columns are strings
-    registrations['UUID'] = registrations['UUID'].astype(str).str.strip().str.upper()
-    scans['UUID'] = scans['UUID'].astype(str).str.strip().str.upper()
-    
-    # Remove unicode replacement characters (common encoding issue)
-    for df in [registrations, scans]:
-        for col in df.columns:
-            dtype = df[col].dtype
-            if pd.api.types.is_object_dtype(dtype) or pd.api.types.is_string_dtype(dtype):
-                df[col] = df[col].apply(lambda x: str(x).replace('\ufffd', '') if pd.notna(x) else x)
-    
-    print(f"Cleaned data (UUID column: '{uuid_col}')")
-    if normalized_names:
-        print(f"Normalized registration columns: {normalized_names}")
-    
-    return registrations, scans
 
-def merge_data(registrations: pd.DataFrame, scans: pd.DataFrame) -> pd.DataFrame:
-    """Join scans with registration data."""
-    
-    merged = pd.merge(
-        scans,
-        registrations,
-        on='UUID',
-        how='left'
+def normalize_registration_columns(registrations: pd.DataFrame) -> pd.DataFrame:
+    by_lowercase = {column.lower(): column for column in registrations}
+    ticket_column = next(
+        (
+            by_lowercase[alias]
+            for alias in TICKET_COLUMN_ALIASES
+            if alias in by_lowercase
+        ),
+        None,
     )
-    
-    # Check for unmatched scans
-    match_column_candidates = ['full_name', 'email', 'phone', 'school', 'Grade']
-    unmatched_col = next((col for col in match_column_candidates if col in merged.columns), None)
-    unmatched = merged[merged[unmatched_col].isna()] if unmatched_col else pd.DataFrame()
-    if len(unmatched) > 0:
-        print(f"WARNING: {len(unmatched)} scans could not be matched to registrations")
-    
-    print(f"Merged data: {len(merged)} records")
-    
-    return merged
+    if ticket_column is None:
+        raise ValueError("The registration CSV needs a UUID or ticket ID column.")
 
-def generate_reports(merged: pd.DataFrame, output_dir: str = 'reports'):
-    """Generate one CSV file per booth or institution."""
-    
-    # Create output directory
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Get unique booth/institution IDs from the historical Uni_ID column.
-    if 'Uni_ID' not in merged.columns:
-        print("ERROR: 'Uni_ID' column not found in scans data")
-        sys.exit(1)
-    
-    scan_targets = merged['Uni_ID'].dropna().unique()
-    print(f"\nGenerating reports for {len(scan_targets)} booth/institution IDs...\n")
-    
-    # Define columns to include in reports
-    # Prioritize common registration fields, exclude internal IDs
-    priority_columns = [
-        'full_name', 'school', 'Grade', 'Age', 'phone',
-        'email', 'intake_year', 'consent_text', 'submission_time', 'UUID'
-    ]
-    
-    # Find which columns actually exist
-    export_columns = [col for col in priority_columns if col in merged.columns]
-    
-    if not export_columns:
-        # Fallback: use all columns except internal ones
-        exclude = ['UUID', 'Uni_ID', 'Timestamp', 'uuid', 'ticket_id']
-        export_columns = [col for col in merged.columns if col not in exclude]
-    
-    print(f"   Exporting columns: {export_columns}\n")
+    names = {ticket_column: "UUID"}
+    used = set(registrations.columns) | {"UUID"}
+    for column in registrations:
+        canonical = REGISTRATION_COLUMN_ALIASES.get(column.lower().replace(" ", "_"))
+        if column != ticket_column and canonical and canonical not in used:
+            names[column] = canonical
+            used.add(canonical)
 
-    match_column_candidates = ['full_name', 'email', 'phone', 'school', 'Grade']
-    report_match_column = next((col for col in match_column_candidates if col in merged.columns), None)
-    
-    # Generate report for each booth/institution.
-    total_leads = 0
-    for uni in sorted(scan_targets):
-        uni_data = merged[merged['Uni_ID'] == uni]
-        
-        # Clean filename
-        uni_clean = str(uni).strip().replace(' ', '_').replace('/', '-')
-        filename = os.path.join(output_dir, f"leads_{uni_clean}.csv")
-        
-        # Export
-        if report_match_column:
-            uni_data = uni_data[uni_data[report_match_column].notna()]
+    registrations = registrations.rename(columns=names)
+    registrations["UUID"] = registrations["UUID"].str.strip().str.upper()
+    registrations = registrations[registrations["UUID"] != ""].drop_duplicates()
+    if registrations["UUID"].duplicated().any():
+        raise ValueError(
+            "Multiple different registrations share a UUID. "
+            "Resolve the duplicate tickets before exporting."
+        )
+    return registrations
 
-        report = uni_data[export_columns].drop_duplicates()
-        report = report.rename(columns=REPORT_COLUMN_LABELS)
-        report.to_csv(filename, index=False, encoding='utf-8')
-        
-        print(f"   OK {uni}: {len(report)} leads -> {filename}")
-        total_leads += len(report)
-    
-    print(f"\nDone. Generated {len(scan_targets)} reports with {total_leads} total leads.")
-    print(f"   Output folder: {os.path.abspath(output_dir)}")
 
-def main():
-    print("\n" + "="*60)
-    print("  traQRecord - Post-Event Processing")
-    print("="*60 + "\n")
-    
-    # Default file names
-    reg_file = 'registrations.csv'
-    scans_file = 'raw_scans.csv'
-    
-    # Allow command-line override
-    if len(sys.argv) >= 3:
-        reg_file = sys.argv[1]
-        scans_file = sys.argv[2]
-    
-    print(f"Registration file: {reg_file}")
-    print(f"Scans file: {scans_file}\n")
-    
-    # Process
-    registrations, scans = load_data(reg_file, scans_file)
-    registrations, scans = clean_data(registrations, scans)
-    merged = merge_data(registrations, scans)
-    generate_reports(merged)
+def safe_csv_value(value: str) -> str:
+    """Keep spreadsheet programs from executing formula-shaped form answers."""
+    if FORMULA_PREFIX.match(value) and not PLAIN_NUMBER.fullmatch(value):
+        return "'" + value
+    return value
+
+
+def generate_reports(
+    registrations: pd.DataFrame, scans: pd.DataFrame, output_dir: Path
+) -> None:
+    if not {"Uni_ID", "UUID"}.issubset(scans.columns):
+        raise ValueError("The raw scans CSV needs Uni_ID and UUID columns.")
+
+    # Use only the scan identity columns. Registration columns, including
+    # custom fields named Timestamp or Uni_ID, come from the private export.
+    organization_column = "__scan_organization"
+    while organization_column in registrations:
+        organization_column += "_"
+    scan_keys = scans[["Uni_ID", "UUID"]].rename(
+        columns={"Uni_ID": organization_column}
+    )
+    scan_keys["UUID"] = scan_keys["UUID"].str.strip().str.upper()
+    scan_keys[organization_column] = scan_keys[organization_column].str.strip()
+    scan_keys = scan_keys[scan_keys[organization_column] != ""]
+    matched = scan_keys[scan_keys["UUID"].isin(registrations["UUID"])]
+    unmatched = len(scan_keys) - len(matched)
+    if unmatched:
+        print(
+            f"WARNING: {unmatched} scans could not be matched to registrations "
+            "and were omitted."
+        )
+    merged = matched.drop_duplicates().merge(
+        registrations, on="UUID", validate="many_to_one"
+    )
+
+    # Preserve traQRecord's earlier report labels and order. Append each
+    # additional source column in input order, without overwriting a field.
+    columns = [column for column in REPORT_COLUMN_LABELS if column in registrations]
+    columns.extend(column for column in registrations if column not in columns)
+    labels = [REPORT_COLUMN_LABELS.get(column, column) for column in columns]
+    if len(labels) != len(set(labels)):
+        raise ValueError("Two registration fields would have the same report header.")
+
+    groups = merged.groupby(organization_column, sort=True)
+    filenames = {
+        organization: f"leads_{quote(organization, safe='-_').replace('.', '%2E')}.csv"
+        for organization in groups.groups
+    }
+    if len({name.casefold() for name in filenames.values()}) != len(filenames):
+        raise ValueError("Two organization IDs would produce the same report filename.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for organization, group in groups:
+        report = group.loc[:, columns].map(safe_csv_value)
+        report.columns = [safe_csv_value(label) for label in labels]
+        report.to_csv(
+            output_dir / filenames[organization], index=False, encoding="utf-8"
+        )
+        print(f"{filenames[organization]}: {len(report)} leads")
+
+    print(f"Generated {len(filenames)} reports with {len(merged)} total leads.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "registrations", nargs="?", type=Path, default=Path("registrations.csv")
+    )
+    parser.add_argument("scans", nargs="?", type=Path, default=Path("raw_scans.csv"))
+    parser.add_argument("--output-dir", type=Path, default=Path("reports"))
+    args = parser.parse_args()
+
+    try:
+        registrations = normalize_registration_columns(load_csv(args.registrations))
+        scans = load_csv(args.scans)
+        generate_reports(registrations, scans, args.output_dir)
+    except (OSError, ValueError) as error:
+        parser.exit(1, f"ERROR: {error}\n")
+
 
 if __name__ == "__main__":
     main()
